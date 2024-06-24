@@ -35,6 +35,42 @@ int setup_temp_dir(char *temp_dir) {
         return -1;
     }
 
+    // Create symlinks for busybox applets
+    snprintf(cmd, sizeof(cmd), "%s/bin/busybox --list > %s/applets.txt", temp_dir, temp_dir);
+    if (system(cmd) == -1) {
+        perror("busybox --list");
+        return -1;
+    }
+
+    char applet_path[256];
+    char applet_file[1024];
+    snprintf(applet_file, sizeof(applet_file), "%s/applets.txt", temp_dir);
+    FILE *applets_file = fopen(applet_file, "r");
+    if (!applets_file) {
+        perror("fopen applets.txt");
+        return -1;
+    }
+
+    while (fgets(applet_path, sizeof(applet_path), applets_file)) {
+        size_t len = strlen(applet_path);
+        if (len > 0 && applet_path[len - 1] == '\n') {
+            applet_path[len - 1] = '\0';
+        }
+        char symlink_path[1024];
+        if (snprintf(symlink_path, sizeof(symlink_path), "%s/bin/%s", temp_dir, applet_path) >= sizeof(symlink_path)) {
+            fprintf(stderr, "symlink path too long\n");
+            fclose(applets_file);
+            return -1;
+        }
+        if (symlink("/bin/busybox", symlink_path) == -1 && errno != EEXIST) {
+            perror("symlink busybox");
+            fclose(applets_file);
+            return -1;
+        }
+    }
+
+    fclose(applets_file);
+
     return 0;
 }
 
@@ -44,6 +80,7 @@ int run_command(void * args)
     char * temp_dir = cmd_args[0];
     char * command = cmd_args[1];
 
+    // NOTE: Needed if calling clone with CLONE_NEWNS?
     // Unshare the mount namespace to isolate it from the host
     if (unshare(CLONE_NEWNS) == -1) {
         perror("unshare");
