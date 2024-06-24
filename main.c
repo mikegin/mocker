@@ -6,13 +6,43 @@
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
 
 #define MAX_CMD_LEN 100
 #define STACK_SIZE (1024 * 1024)
 
+int setup_temp_dir(char *temp_dir) {
+    // Create a temporary directory in /tmp
+    strcpy(temp_dir, "/tmp/mockerXXXXXX");
+    if (!mkdtemp(temp_dir)) {
+        perror("mkdtemp");
+        return -1;
+    }
+
+    // Create necessary directories in the temporary directory
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s/bin %s/proc", temp_dir, temp_dir);
+    if (system(cmd) == -1) {
+        perror("mkdir -p");
+        return -1;
+    }
+
+    // Copy busybox to the temporary directory
+    snprintf(cmd, sizeof(cmd), "cp /bin/busybox %s/bin/", temp_dir);
+    if (system(cmd) == -1) {
+        perror("cp busybox");
+        return -1;
+    }
+
+    return 0;
+}
+
 int run_command(void * args)
 {
     char ** cmd_args = (char **)args;
+    char * temp_dir = cmd_args[0];
+    char * command = cmd_args[1];
 
     // Unshare the mount namespace to isolate it from the host
     if (unshare(CLONE_NEWNS) == -1) {
@@ -27,16 +57,8 @@ int run_command(void * args)
         return EXIT_FAILURE;
     }
 
-    // Get the current working directory
-    char cwd[1024];
-    if (getcwd(cwd, sizeof(cwd)) == NULL)
-    {
-        perror("getcwd");
-        return EXIT_FAILURE;
-    }
-
-    // Change root directory to the current working directory
-    if (chroot(cwd) == -1)
+    // Change root directory to the temporary directory
+    if (chroot(temp_dir) == -1)
     {
         perror("chroot");
         return EXIT_FAILURE;
@@ -49,21 +71,13 @@ int run_command(void * args)
         return EXIT_FAILURE;
     }
 
-    struct stat st = {0};
-    if (stat("/proc", &st) == -1) {
-        if (mkdir("/proc", 0755) == -1) {
-            perror("mkdir /proc");
-            return EXIT_FAILURE;
-        }
-    }
-
     // Mount /proc
     if (mount("proc", "/proc", "proc", 0, NULL) == -1) {
         perror("mount /proc");
         return EXIT_FAILURE;
     }
 
-    execvp(cmd_args[0], cmd_args);
+    execvp(command, &cmd_args[1]);
     perror("execvp");
 
     // This code will only be reached if execvp fails
@@ -71,9 +85,7 @@ int run_command(void * args)
     if (umount("/proc") == -1) {
         perror("umount /proc");
     }
-    if (rmdir("/proc") == -1) {
-        perror("rmdir /proc");
-    }
+    rmdir("/proc");
 
     return EXIT_FAILURE;
 }
@@ -81,8 +93,6 @@ int run_command(void * args)
 int main(int argc, char ** args)
 {
     char * first = args[0];
-
-    // char cmd[MAX_CMD_LEN] = "", **p;
 
     if (argc < 3) {
         fprintf(stderr, "Usage: %s run <command> <args>\n", first);
@@ -97,54 +107,80 @@ int main(int argc, char ** args)
         return EXIT_FAILURE;
     }
 
-    // strcat(cmd, args[2]);
-    
-    // for(p = &args[3]; *p; p++)
-    // {
-    //     strcat(cmd, " ");
-    //     strcat(cmd, *p);
-    // }
+    // Setup temporary directory
+    char temp_dir[1024];
+    if (setup_temp_dir(temp_dir) == -1) {
+        return EXIT_FAILURE;
+    }
 
-    char * cmd_args[argc - 1]; // range is args[2] til args[argc - 1], size therefore is argc - 2, but we need 1 for the NULL terminator, so argc - 1
+    char ** cmd_args = malloc(sizeof(char *) * (argc - 1 + 1)); // range is args[2] til args[argc - 1], size therefore is argc - 2, but we need 1 for the NULL terminator, and 1 for temp_dir, so argc - 1 + 1
+    if (!cmd_args) {
+        perror("malloc");
+        return EXIT_FAILURE;
+    }
+    cmd_args[0] = temp_dir;
     for (int i = 2; i < argc; i++)
     {
-        cmd_args[i - 2] = args[i];
+        cmd_args[i - 1] = args[i];
     }
-    cmd_args[argc - 2] = NULL;
+    cmd_args[argc - 1] = NULL;
 
     char * stack = malloc(STACK_SIZE);
     if (stack == NULL)
     {
         perror("malloc");
+        free(cmd_args);
         return EXIT_FAILURE;
     }
 
+    // Create a new UTS, mount, and PID namespace
     pid_t pid = clone(run_command, stack + STACK_SIZE, CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | SIGCHLD, cmd_args);
 
     if (pid == -1) {
         perror("clone");
         free(stack);
+        free(cmd_args);
         return EXIT_FAILURE;
     }
-
 
     // Wait for the child process to finish
     int status;
     if (waitpid(pid, &status, 0) == -1) {
         perror("waitpid");
         free(stack);
+        free(cmd_args);
         return EXIT_FAILURE;
     }
 
     // Unmount /proc and remove the directory after the child process finishes
-    if (umount("proc") == -1) {
-        perror("umount proc");
-    }
-    if (rmdir("proc") == -1) {
-        perror("rmdir proc");
+    char proc_path[1024];
+    if (snprintf(proc_path, sizeof(proc_path), "%s/proc", temp_dir) >= sizeof(proc_path)) {
+        fprintf(stderr, "proc path too long\n");
+        free(stack);
+        free(cmd_args);
+        return EXIT_FAILURE;
     }
 
+    if (umount(proc_path) == -1) {
+        perror("umount /proc");
+    }
+
+    // Remove temporary directory recursively
+    char remove_cmd[1024];
+    if (snprintf(remove_cmd, sizeof(remove_cmd), "rm -rf %s", temp_dir) >= sizeof(remove_cmd)) {
+        fprintf(stderr, "remove command too long\n");
+        free(stack);
+        free(cmd_args);
+        return EXIT_FAILURE;
+    }
+
+    if (system(remove_cmd) == -1) {
+        perror("rm -rf temp_dir");
+    }
+
+
     free(stack);
+    free(cmd_args);
 
     // Return the exit status of the child process
     if (WIFEXITED(status)) {
