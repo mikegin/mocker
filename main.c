@@ -8,9 +8,23 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdint.h>
+#include <limits.h>
+#include <fcntl.h>
 
 #define MAX_CMD_LEN 100
 #define STACK_SIZE (1024 * 1024)
+
+#define CGROUP_PATH "/sys/fs/cgroup/mycgroup"
+#define CGROUP_PROCS_FILE "cgroup.procs"
+#define CGROUP_MEMORY_FILE "memory.max"
+#define CGROUP_CPU_FILE "cpu.max"
+
+
+typedef struct child_args {
+    char ** cmd_args;
+    int * pipefd; 
+} child_args;
 
 int setup_temp_dir(char *temp_dir) {
     // Create a temporary directory in /tmp
@@ -71,14 +85,102 @@ int setup_temp_dir(char *temp_dir) {
 
     fclose(applets_file);
 
+    // Copy cputest and memtest into temp folder (used to test cgroups)
+    snprintf(cmd, sizeof(cmd), "cp cputest %s && chmod +x cputest", temp_dir);
+    if (system(cmd) == -1) {
+        perror("cp cputest");
+        return -1;
+    }
+    snprintf(cmd, sizeof(cmd), "cp memtest %s && chmod +x memtest", temp_dir);
+    if (system(cmd) == -1) {
+        perror("cp memtest");
+        return -1;
+    }
+
     return 0;
+}
+
+int create_cgroup(const char *cgroup_path) {
+    if (mkdir(cgroup_path, 0755) != 0) {
+        if (errno != EEXIST) {
+            perror("mkdir");
+            return -1;
+        }
+    }
+    fprintf(stdout, "created c group\n");
+    return 0;
+}
+
+int set_cgroup_value(const char *cgroup_path, const char *file, const char *value) {
+    char filepath[256];
+    snprintf(filepath, sizeof(filepath), "%s/%s", cgroup_path, file);
+    FILE * fp = fopen(filepath, "wb");
+    if (!fp)
+    {
+        perror("fopen");
+        return -1;
+    }
+    fprintf(fp, "%s", value);
+    fclose(fp);
+    return 0;
+}
+
+int add_pid_to_cgroup(const char *cgroup_path, pid_t pid) {
+    char pid_str[16];
+    snprintf(pid_str, sizeof(pid_str), "%d", pid);
+    return set_cgroup_value(cgroup_path, CGROUP_PROCS_FILE, pid_str);
+}
+
+static void update_map(char *mapping, char *map_file) {
+    int fd;
+    size_t map_len;
+
+    map_len = strlen(mapping);
+    for (size_t j = 0; j < map_len; j++)
+        if (mapping[j] == ',')
+            mapping[j] = '\n';
+
+    fd = open(map_file, O_RDWR);
+    if (fd == -1) {
+        fprintf(stderr, "ERROR: open %s: %s\n", map_file, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    if (write(fd, mapping, map_len) != map_len) {
+        fprintf(stderr, "ERROR: write %s: %s\n", map_file, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    close(fd);
+}
+
+static void proc_setgroups_write(pid_t child_pid, char *str) {
+    char setgroups_path[PATH_MAX];
+    int fd;
+
+    snprintf(setgroups_path, PATH_MAX, "/proc/%jd/setgroups", (intmax_t) child_pid);
+
+    fd = open(setgroups_path, O_RDWR);
+    if (fd == -1) {
+        if (errno != ENOENT)
+            fprintf(stderr, "ERROR: open %s: %s\n", setgroups_path, strerror(errno));
+        return;
+    }
+
+    if (write(fd, str, strlen(str)) == -1)
+        fprintf(stderr, "ERROR: write %s: %s\n", setgroups_path, strerror(errno));
+
+    close(fd);
 }
 
 int run_command(void * args)
 {
-    char ** cmd_args = (char **)args;
+    child_args * ca = (child_args *) args;
+    int * pipefd = ca->pipefd;
+    char ** cmd_args = ca->cmd_args;
     char * temp_dir = cmd_args[0];
     char * command = cmd_args[1];
+
 
     // NOTE: Needed if calling clone with CLONE_NEWNS?
     // Unshare the mount namespace to isolate it from the host
@@ -86,6 +188,7 @@ int run_command(void * args)
         perror("unshare");
         return EXIT_FAILURE;
     }
+
 
     char * namespace = "new_namespace";
     if (sethostname(namespace, strlen(namespace)) == -1)
@@ -114,6 +217,16 @@ int run_command(void * args)
         return EXIT_FAILURE;
     }
 
+
+    close(pipefd[1]);
+
+    char buffer;
+    if (read(pipefd[0], &buffer, 1) != 1) {
+        perror("read");
+        return 1;
+    }
+    close(pipefd[0]);
+    
     execvp(command, &cmd_args[1]);
     perror("execvp");
 
@@ -170,8 +283,19 @@ int main(int argc, char ** args)
         return EXIT_FAILURE;
     }
 
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        perror("pipe");
+        return 1;
+    }
+
+    child_args * ca = (child_args *)malloc(sizeof(child_args));
+    ca->cmd_args = cmd_args;
+    ca->pipefd = pipefd;
+
+
     // Create a new UTS, mount, and PID namespace
-    pid_t pid = clone(run_command, stack + STACK_SIZE, CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | SIGCHLD, cmd_args);
+    pid_t pid = clone(run_command, stack + STACK_SIZE, CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | SIGCHLD, ca);
 
     if (pid == -1) {
         perror("clone");
@@ -179,6 +303,42 @@ int main(int argc, char ** args)
         free(cmd_args);
         return EXIT_FAILURE;
     }
+
+
+    char map_path[PATH_MAX];
+
+    snprintf(map_path, PATH_MAX, "/proc/%ld/uid_map",  (intmax_t) pid);
+    update_map("0 1000 1", map_path);
+    printf("Updated UID map: %s\n", map_path);
+
+
+    snprintf(map_path, PATH_MAX, "/proc/%ld/gid_map", (intmax_t) pid);
+    proc_setgroups_write(pid, "deny");
+    printf("Setgroups set to deny for: %s\n", map_path);
+    update_map("0 1000 1", map_path);
+    printf("Updated GID map: %s\n", map_path);
+
+    // Create and configure cgroup
+    if (create_cgroup(CGROUP_PATH) != 0) {
+        return 1;
+    }
+    if (set_cgroup_value(CGROUP_PATH, CGROUP_MEMORY_FILE, "10000000") != 0) {  // 10 MB
+        return 1;
+    }
+    if (set_cgroup_value(CGROUP_PATH, CGROUP_CPU_FILE, "10000 100000") != 0) {  // 10% of a CPU
+        return 1;
+    }
+    if (add_pid_to_cgroup(CGROUP_PATH, pid) != 0) {
+        return 1;
+    }
+
+    close(pipefd[0]);
+
+    if (write(pipefd[1], "1", 1) != 1) {
+        perror("write");
+        return 1;
+    }
+    close(pipefd[1]);
 
     // Wait for the child process to finish
     int status;
